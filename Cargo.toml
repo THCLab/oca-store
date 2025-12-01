@@ -21,10 +21,9 @@ dyn-clonable = "0.9.0"
 isolang = "2.3.0"
 oca-ast = { version = "2.0.0-rc.3" }
 oca-bundle = { version = "2.0.0-rc.5" }
-oca-dag = { version = "2.0.0-rc.2" }
+oca-dag = { version = "2.0.0-rc.5" }
 oca-file = { version = "2.0.0-rc.4" }
 overlay-file = { version = "1.0.0-rc.3" }
-# transformation-file = { version = "2.0.0-rc2", path = "../transformation/transformation-file" }
 regex = "1.9.5"
 rusqlite = "0.37.0"
 said = { version = "0.5.2" }
