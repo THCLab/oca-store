@@ -646,7 +646,7 @@ ADD Overlay ENTRY
 "#
         .to_string();
 
-        let registry = OverlayLocalRegistry::from_dir("../overlay-file/core_overlays").unwrap();
+        let registry = OverlayLocalRegistry::from_dir("tests/core_overlays").unwrap();
         let oca_bundle = facade
             .build_from_ocafile(ocafile_input, registry.clone())
             .unwrap();

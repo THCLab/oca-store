@@ -823,16 +823,15 @@ dependencies = [
 
 [[package]]
 name = "oca-dag"
-version = "2.0.0-rc.2"
+version = "2.0.0-rc.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ce16c1274386ea0ff8467f80e90278f996139f3da93f01a6a746f36877b3e6e8"
+checksum = "e1a753d15a511964b76b913b94642bce0ae52ca73fb384a7ef002e0ffe4f30f0"
 dependencies = [
  "dyn-clonable",
  "indexmap",
  "isolang",
  "oca-ast",
  "oca-bundle",
- "overlay-file",
  "said",
  "serde",
  "serde_json",
