@@ -17,6 +17,9 @@ use oca_bundle::state::oca_bundle::{OCABundle, OCABundleModel};
 use oca_dag::build_core_db_model;
 use oca_file::ocafile;
 use overlay_file::overlay_registry::OverlayLocalRegistry;
+use std::str::FromStr;
+#[cfg(feature = "local-references")]
+use said::SelfAddressingIdentifier;
 
 #[derive(thiserror::Error, Debug, serde::Serialize)]
 #[serde(untagged)]
@@ -46,6 +49,10 @@ pub enum ValidationError {
     #[cfg(feature = "local-references")]
     #[error("Reference {0} not found")]
     UnknownRefn(String),
+    #[error("Local references not enabled")]
+    LocalReferencesNotEnabled(),
+    #[error("Storage error: {0}")]
+    StorageError(String),
 }
 
 #[cfg(feature = "local-references")]
@@ -58,6 +65,39 @@ impl References for Box<dyn DataStorage> {
 
     fn save(&mut self, refn: &str, value: String) {
         self.insert(Namespace::OCAReferences, refn, value.to_string().as_bytes())
+            .unwrap()
+    }
+}
+
+#[cfg(feature = "local-references")]
+impl References for dyn DataStorage + '_ {
+    fn find(&self, refn: &str) -> Option<String> {
+        self.get(Namespace::OCAReferences, refn)
+            .unwrap()
+            .map(|said| String::from_utf8(said).unwrap())
+    }
+
+    fn save(&mut self, refn: &str, value: String) {
+        self.insert(Namespace::OCAReferences, refn, value.to_string().as_bytes())
+            .unwrap()
+    }
+}
+
+#[cfg(feature = "local-references")]
+struct DataStorageReferences<'a>(&'a mut dyn DataStorage);
+
+#[cfg(feature = "local-references")]
+impl References for DataStorageReferences<'_> {
+    fn find(&self, refn: &str) -> Option<String> {
+        self.0
+            .get(Namespace::OCAReferences, refn)
+            .unwrap()
+            .map(|said| String::from_utf8(said).unwrap())
+    }
+
+    fn save(&mut self, refn: &str, value: String) {
+        self.0
+            .insert(Namespace::OCAReferences, refn, value.to_string().as_bytes())
             .unwrap()
     }
 }
@@ -86,32 +126,19 @@ pub fn parse_oca_bundle_to_ocafile(bundle: &OCABundleModel) -> String {
 }
 
 impl Facade {
+    // TODO this name is misleading, it does not only validate ocafile, it builds
     #[cfg(not(feature = "local-references"))]
     pub fn validate_ocafile(
         &self,
         ocafile: String,
         registry: OverlayLocalRegistry,
     ) -> Result<OCABuild, Vec<ValidationError>> {
-        let (base, oca_ast) = Self::parse_and_check_base(self.storage(), ocafile, registry)?;
+        let (base, oca_ast) = Self::parse_and_check_base(self.storage(), ocafile, registry, None)?;
         oca_bundle::build::from_ast(base, &oca_ast).map_err(|e| {
             e.iter()
                 .map(|e| ValidationError::OCABundleBuild(e.clone()))
                 .collect::<Vec<_>>()
         })
-    }
-
-    /// Validate ocafile using external references for dereferencing `refn`.  It
-    /// won't update facade internal database with `refn`-> `said` mapping, so `refn`
-    /// can't be dereferenced in ocafiles processed later.
-    #[cfg(feature = "local-references")]
-    pub fn validate_ocafile_with_external_references<R: References>(
-        &self,
-        ocafile: String,
-        references: &mut R,
-        registry: OverlayLocalRegistry,
-    ) -> Result<OCABuild, Vec<ValidationError>> {
-        let (base, oca_ast) = Self::parse_and_check_base(self.storage(), ocafile, registry)?;
-        Self::oca_ast_to_oca_build_with_references(base, oca_ast, references)
     }
 
     /// Validate ocafile using internal references for dereferencing `refn`.
@@ -124,8 +151,28 @@ impl Facade {
         ocafile: String,
         registry: OverlayLocalRegistry,
     ) -> Result<OCABuild, Vec<ValidationError>> {
-        let (base, oca_ast) = Self::parse_and_check_base(self.storage(), ocafile, registry)?;
+        let storage: &dyn DataStorage = &*self.db_cache;
+        let (base, oca_ast) = {
+            let refs = DataStorageReferences(self.db.as_mut());
+            Self::parse_and_check_base(storage, ocafile, registry, Some(&refs))?
+        };
         Self::oca_ast_to_oca_build_with_references(base, oca_ast, &mut self.db)
+    }
+
+    /// Validate ocafile using external references for dereferencing `refn`.  It
+    /// won't update facade internal database with `refn`-> `said` mapping, so `refn`
+    /// can't be dereferenced in ocafiles processed later.
+    #[cfg(feature = "local-references")]
+    pub fn validate_ocafile_with_external_references<R: References>(
+        &self,
+        ocafile: String,
+        references: &mut R,
+        registry: OverlayLocalRegistry,
+    ) -> Result<OCABuild, Vec<ValidationError>> {
+        let refs: &dyn References = references;
+        let (base, oca_ast) =
+            Self::parse_and_check_base(self.storage(), ocafile, registry, Some(refs))?;
+        Self::oca_ast_to_oca_build_with_references(base, oca_ast, references)
     }
 
     pub fn build(&mut self, oca_build: &mut OCABuild) -> Result<OCABundleModel, Error> {
@@ -161,28 +208,42 @@ impl Facade {
         storage: &dyn DataStorage,
         ocafile: String,
         registry: OverlayLocalRegistry,
+        #[cfg(feature = "local-references")] references: Option<&dyn References>,
+        #[cfg(not(feature = "local-references"))] _references: Option<()>,
     ) -> Result<(Option<OCABundleModel>, OCAAst), Vec<ValidationError>> {
-        let mut errors: Vec<ValidationError> = vec![];
+        // Parse the OCAFILE into an AST, collecting any parse errors.
         let mut oca_ast = ocafile::parse_from_string(ocafile, &registry).map_err(|e| {
             vec![ValidationError::OCAFileParse(
                 oca_file::ocafile::error::ParseError::Custom(e.to_string()),
             )]
         })?;
 
-        if !errors.is_empty() {
-            return Err(errors);
-        }
-
+        // Attempt to determine if the first command is a FROM command that references
+        // an existing OCABundle. If so, load that bundle into `base`.
         let mut base: Option<OCABundleModel> = None;
-        // TODO it does only the reference FROM command check how we do it now
-        // TODO this should be avoided if the ast is passed for further processing, the base is
-        // checked again in generate bundle
+
         if let Some(first_command) = oca_ast.commands.first()
             && let (oca_ast::ast::CommandType::From, ObjectKind::OCABundle(content)) = (
                 first_command.clone().kind,
                 first_command.clone().object_kind,
             )
         {
+            let default_command_meta = oca_ast::ast::CommandMeta {
+                line_number: 0,
+                raw_line: "unknown".to_string(),
+            };
+            let command_meta = oca_ast
+                .commands_meta
+                .get(&0)
+                .unwrap_or(&default_command_meta);
+            let invalid_command = |message: String| {
+                Vec::from([ValidationError::InvalidCommand {
+                    line_number: command_meta.line_number,
+                    raw_line: command_meta.raw_line.clone(),
+                    message,
+                }])
+            };
+
             match content.said {
                 ReferenceAttrType::Reference(refs) => match refs {
                     RefValue::Said(said) => match get_oca_bundle_model(storage, said) {
@@ -191,29 +252,60 @@ impl Facade {
                             base = Some(bundle_model.clone());
                         }
                         Err(e) => {
-                            let default_command_meta = oca_ast::ast::CommandMeta {
-                                line_number: 0,
-                                raw_line: "unknown".to_string(),
-                            };
-                            let command_meta = oca_ast
-                                .commands_meta
-                                .get(&0)
-                                .unwrap_or(&default_command_meta);
-                            e.iter().for_each(|e| {
-                                errors.push(ValidationError::InvalidCommand {
-                                    line_number: command_meta.line_number,
-                                    raw_line: command_meta.raw_line.clone(),
-                                    message: e.clone(),
-                                })
-                            });
-                            return Err(errors);
+                            return Err(invalid_command(format!("Failed to load bundle: {:?}", e)));
                         }
                     },
-                    RefValue::Name(_) => todo!(),
+                    RefValue::Name(name) => {
+                        #[allow(unused_variables)]
+                        let name = name;
+
+                        #[cfg(feature = "local-references")]
+                        {
+                            match references.and_then(|refs| refs.find(&name)) {
+                                Some(said) => match SelfAddressingIdentifier::from_str(&said) {
+                                    Ok(said_identifier) => {
+                                        match get_oca_bundle_model(storage, said_identifier) {
+                                            Ok(bundle_model) => {
+                                                info!(
+                                                    "Base OCABundle found from refn: {:?}",
+                                                    bundle_model.digest
+                                                );
+                                                base = Some(bundle_model.clone());
+                                            }
+                                            Err(e) => {
+                                                return Err(invalid_command(format!(
+                                                    "Failed to load bundle: {:?}",
+                                                    e
+                                                )));
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        return Err(invalid_command(format!(
+                                            "Invalid SAID format: {}",
+                                            e
+                                        )));
+                                    }
+                                },
+                                None => {
+                                    return Err(invalid_command(format!(
+                                        "Reference {} not found",
+                                        name
+                                    )));
+                                }
+                            }
+                        }
+                        #[cfg(not(feature = "local-references"))]
+                        {
+                            return Err(vec![ValidationError::LocalReferencesNotEnabled()]);
+                        }
+                    }
                 },
             }
-            oca_ast.commands.remove(0);
-        };
+            // Remove the FROM command from the AST as it has been processed.
+            let _ = oca_ast.commands.remove(0);
+        }
+
         Ok((base, oca_ast))
     }
 
@@ -410,5 +502,76 @@ impl Facade {
                     .unwrap();
             }
         });
+    }
+}
+
+#[cfg(all(test, feature = "local-references"))]
+mod tests {
+    use super::*;
+    use crate::data_storage::{DataStorage, Namespace, SledDataStorage, SledDataStorageConfig};
+    use crate::repositories::SQLiteConfig;
+    use overlay_file::overlay_registry::OverlayLocalRegistry;
+    use std::fs;
+    use std::str::FromStr;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_storage_dir() -> std::path::PathBuf {
+        let mut path = std::env::temp_dir();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        path.push(format!("oca_store_refn_test_{}", nanos));
+        path
+    }
+
+    #[test]
+    fn stores_and_resolves_refn() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let storage_dir = temp_storage_dir();
+        fs::create_dir_all(&storage_dir).unwrap();
+
+        let storage_config = SledDataStorageConfig::build()
+            .path(storage_dir.clone())
+            .unwrap();
+        let db = SledDataStorage::new().config(storage_config);
+        let db_cache = db.clone();
+        let cache_storage_config = SQLiteConfig::build().unwrap();
+        let mut facade = Facade::new(Box::new(db), Box::new(db_cache), cache_storage_config);
+
+        let registry = OverlayLocalRegistry::from_dir("tests/core_overlays").unwrap();
+        let base_ocafile = r#"
+-- name=base
+ADD ATTRIBUTE name=Text
+"#
+        .to_string();
+        let _ = facade
+            .build_from_ocafile(base_ocafile, registry.clone())
+            .unwrap();
+
+        let stored = facade
+            .storage()
+            .get(Namespace::OCAReferences, "base")
+            .unwrap();
+        assert!(stored.is_some(), "refn should be stored in storage");
+
+        let refn_ocafile = r#"
+ADD ATTRIBUTE linked=refn:base
+"#
+        .to_string();
+        let bundle = facade.build_from_ocafile(refn_ocafile, registry).unwrap();
+
+        let stored = stored
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+            .expect("refn should be stored as utf-8");
+        let stored_said = said::SelfAddressingIdentifier::from_str(&stored).unwrap();
+        match bundle.capture_base.attributes.get("linked") {
+            Some(oca_ast::ast::NestedAttrType::Reference(oca_ast::ast::RefValue::Said(said))) => {
+                assert_eq!(said, &stored_said);
+            }
+            other => panic!("expected linked to resolve to said, got {:?}", other),
+        }
+
+        let _ = fs::remove_dir_all(storage_dir);
     }
 }
