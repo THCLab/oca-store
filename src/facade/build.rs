@@ -257,7 +257,6 @@ impl Facade {
                     },
                     RefValue::Name(name) => {
                         #[allow(unused_variables)]
-                        let name = name;
 
                         #[cfg(feature = "local-references")]
                         {
